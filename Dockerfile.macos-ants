@@ -1,0 +1,234 @@
+# Native build of the 302 neuroimaging image, WITH ANTs.
+#
+# This is ./Dockerfile.macos plus ANTs, and it exists because no one publishes a
+# prebuilt ANTs for linux/arm64. Verified absent from every distribution channel:
+#
+#   conda-forge            linux-64, osx-64, osx-arm64  -- no linux-aarch64
+#   Ubuntu noble apt       no `ants` installation candidate at all
+#   ANTsX/ANTs releases    every Linux asset is X64 (almalinux, centos, ubuntu)
+#   PyPI antspyx           Linux wheels are manylinux_2_17_x86_64 only
+#   Docker Hub antsx/ants  all 27 tags are linux/amd64
+#
+# The ARM64 builds that do exist (macos-14-ARM64, osx-arm64, the macOS antspyx
+# wheels) are Darwin binaries and cannot run in a Linux container. So the only
+# way to get ANTs here is to compile it, which is what the ants-builder stage
+# below does.
+#
+# COST: the ANTs stage is a CMake superbuild -- it builds ITK (~2500 sources)
+# and then ~200 heavily-templated ANTs programs. Budget 60-120 min on 6 cores.
+# It is a separate stage, so it is cached and only rebuilt when ANTS_VERSION or
+# the base image changes; editing the notebook or the pip layer does not re-pay
+# it. Raising the CPUs available to your Docker VM is the biggest lever.
+#
+# If you do not need ANTs, use ./Dockerfile.macos -- it builds in minutes.
+
+# Ubuntu 24.04 LTS - Noble. Multi-arch, and the platform AFNI's shared builds target.
+ARG BASE_IMAGE=ubuntu:noble-20250910
+
+# Utilities for downloading packages
+FROM ${BASE_IMAGE} AS downloader
+# Bump the date to current to refresh curl/certificates/etc
+RUN echo "2026.09.14"
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive \
+    apt-get install -y --no-install-recommends \
+                    binutils \
+                    bzip2 \
+                    ca-certificates \
+                    curl \
+                    unzip && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# AFNI
+FROM downloader AS afni
+# Bump the date to current to update AFNI
+RUN echo "2026.09.14"
+# Ask the build container what it is rather than trusting BuildKit's TARGETARCH.
+# TARGETARCH is unusable here: the legacy builder (DOCKER_BUILDKIT=0) never sets
+# it at all, and declaring `ARG TARGETARCH=<default>` to paper over that shadows
+# the value BuildKit would otherwise inject — so a cross-build would silently
+# fetch the wrong package. This stage always runs on the target platform, so
+# dpkg reports the architecture we actually need, under either builder and with
+# or without --platform.
+RUN arch="$(dpkg --print-architecture)" \
+    && case "${arch}" in \
+        arm64) AFNI_BUILD=linux_ubuntu_24_ARM ;; \
+        amd64) AFNI_BUILD=linux_ubuntu_24_64 ;; \
+        *) echo "Unsupported architecture '${arch}': AFNI publishes Ubuntu 24 builds for arm64 and amd64 only." >&2; exit 1 ;; \
+    esac \
+    && echo "Fetching AFNI build ${AFNI_BUILD} for ${arch}" \
+    && mkdir -p /opt/afni-latest \
+    && curl -fsSL --retry 5 "https://afni.nimh.nih.gov/pub/dist/tgz/${AFNI_BUILD}.tgz" \
+    | tar -xz -C /opt/afni-latest --strip-components 1 \
+    --exclude "${AFNI_BUILD}/funstuff" \
+    --exclude "${AFNI_BUILD}/shiny" \
+    --exclude "${AFNI_BUILD}/afnipy" \
+    --exclude "${AFNI_BUILD}/lib/RetroTS" \
+    --exclude "${AFNI_BUILD}/lib_RetroTS" \
+    --exclude "${AFNI_BUILD}/meica.libs"
+
+# ANTs, compiled from source. This is the expensive stage.
+FROM ${BASE_IMAGE} AS ants-builder
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update -qq \
+    && apt-get install -y -q --no-install-recommends \
+           build-essential \
+           ca-certificates \
+           cmake \
+           git \
+           ninja-build \
+           zlib1g-dev \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+ARG ANTS_VERSION=v2.6.5
+# Parallelism for the ANTs compile.
+#
+# Empty means "decide automatically", and the rule is deliberately NOT plain
+# $(nproc): ANTs links ~200 static binaries and a linker process can peak around
+# 2 GB. On a base-model 8 GB M1, whose Docker VM typically gets only 2-4 GB,
+# -j$(nproc) would spawn 8 linkers and OOM. So the default is capped by memory as
+# well as by cores: min(nproc, MemTotal/2GB), floor 1.
+#
+# Override explicitly if you know better: --build-arg ANTS_BUILD_JOBS=4
+ARG ANTS_BUILD_JOBS=
+
+RUN git clone --depth 1 --branch "${ANTS_VERSION}" https://github.com/ANTsX/ANTs.git /tmp/ants-src
+
+# The ANTs superbuild fetches and builds ITK, then builds ANTs against it. The
+# install target lives in the nested ANTS-build directory, not at the top level.
+RUN jobs="${ANTS_BUILD_JOBS}"; \
+    if [ -z "${jobs}" ]; then \
+        cores="$(nproc)"; \
+        mem_gb="$(awk '/^MemTotal:/ {printf "%d", $2/1048576}' /proc/meminfo)"; \
+        by_mem="$(( mem_gb * 2 / 3 ))"; \
+        if [ "${by_mem}" -lt 1 ]; then by_mem=1; fi; \
+        if [ "${by_mem}" -lt "${cores}" ]; then jobs="${by_mem}"; else jobs="${cores}"; fi; \
+        echo "Auto job count: ${cores} cores, ${mem_gb} GB RAM -> -j${jobs}"; \
+        if [ "${mem_gb}" -lt 6 ]; then \
+            echo "WARNING: only ${mem_gb} GB available to this build."; \
+            echo "WARNING: ANTs will compile at -j${jobs} and may take many hours."; \
+            echo "WARNING: Give the Docker VM 8 GB or more, or use ./Dockerfile.macos (no ANTs)."; \
+        fi; \
+    fi; \
+    set -e; \
+    echo "Building ANTs ${ANTS_VERSION} for $(dpkg --print-architecture) with -j${jobs}" \
+    && mkdir -p /tmp/ants-build \
+    && cd /tmp/ants-build \
+    && cmake \
+         -DCMAKE_BUILD_TYPE=Release \
+         -DCMAKE_INSTALL_PREFIX=/opt/ants \
+         -DBUILD_TESTING=OFF \
+         -DBUILD_SHARED_LIBS=OFF \
+         -DRUN_LONG_TESTS=OFF \
+         -DRUN_SHORT_TESTS=OFF \
+         -DUSE_VTK=OFF \
+         /tmp/ants-src \
+    && make -j"${jobs}" \
+    && cd ANTS-build \
+    && make install \
+    && rm -rf /tmp/ants-src /tmp/ants-build
+
+FROM ${BASE_IMAGE}
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# Runtime dependencies of AFNI's Ubuntu 24.04 shared builds, plus git/git-annex
+# for datalad and the Python interpreter the notebook environment is built on.
+# Note the noble renames: libxt6 -> libxt6t64, libglib2.0-0 -> libglib2.0-0t64,
+# and libglw1-mesa was folded into libglw1-mesa-dev.
+RUN apt-get update -qq \
+    && apt-get install -y -q --no-install-recommends \
+           ca-certificates \
+           curl \
+           ed \
+           git \
+           git-annex \
+           libexpat1 \
+           libgl1 \
+           libglib2.0-0t64 \
+           libglu1-mesa \
+           libglw1-mesa-dev \
+           libgomp1 \
+           libgsl27 \
+           libjpeg62 \
+           libx11-6 \
+           libxext6 \
+           libxm4 \
+           libxpm4 \
+           libxt6t64 \
+           netpbm \
+           python3 \
+           python3-venv \
+           tcsh \
+           xfonts-base \
+           xvfb \
+           zlib1g \
+    && apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* \
+    && ldconfig
+
+# Install AFNI
+ENV AFNI_DIR="/opt/afni"
+COPY --from=afni /opt/afni-latest ${AFNI_DIR}
+ENV PATH="${AFNI_DIR}:$PATH" \
+    LD_LIBRARY_PATH="${AFNI_DIR}" \
+    AFNI_IMSAVE_WARNINGS="NO" \
+    AFNI_MODELPATH="${AFNI_DIR}/models" \
+    AFNI_TTATLAS_DATASET="${AFNI_DIR}/atlases" \
+    AFNI_PLUGINPATH="${AFNI_DIR}/plugins"
+
+# Install ANTs
+ENV ANTSPATH="/opt/ants/bin"
+COPY --from=ants-builder /opt/ants /opt/ants
+ENV PATH="${ANTSPATH}:$PATH"
+
+# Notebook environment. Every wheel here is pure Python or has arm64 wheels on
+# PyPI, so no conda channel is involved.
+ENV VIRTUAL_ENV="/opt/venv"
+RUN python3 -m venv ${VIRTUAL_ENV}
+ENV PATH="${VIRTUAL_ENV}/bin:$PATH"
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir datalad ipyniivue jupyter
+
+# Create a shared $HOME directory.
+#
+# `databot` is pinned to UID/GID 1000 so this image matches ./Dockerfile, whose
+# base has no user in the 1000+ range. ubuntu:noble ships a stock `ubuntu` user
+# on 1000, so that one has to go first or databot would silently land on 1001
+# and bind-mounted host directories would come back owned by the wrong user.
+#
+# On Linux, override these to line the container user up with your host account:
+#   docker build -f Dockerfile.macos-ants \
+#     --build-arg DATABOT_UID="$(id -u)" --build-arg DATABOT_GID="$(id -g)" ...
+ARG DATABOT_UID=1000
+ARG DATABOT_GID=1000
+RUN if id ubuntu >/dev/null 2>&1; then userdel -r ubuntu >/dev/null 2>&1 || userdel ubuntu; fi \
+    && groupadd -g ${DATABOT_GID} databot \
+    && useradd -m -s /bin/bash -u ${DATABOT_UID} -g ${DATABOT_GID} -G users databot
+
+WORKDIR /home/databot
+ENV HOME="/home/databot"
+
+RUN chmod 755 /home/databot
+
+USER databot
+
+# Pacify datalad
+RUN git config --global user.name "302 data computation" \
+    && git config --global user.email "302@hes-so.ch"
+
+RUN mkdir -p $HOME/data $HOME/outputs $HOME/work $HOME/.local $HOME/src \
+    && chmod 1777 $HOME/data $HOME/outputs $HOME/work $HOME/.local $HOME/src \
+    && datalad clone https://github.com/OpenNeuroDatasets/ds000005 $HOME/data/ds000005 \
+    && datalad get -d $HOME/data/ds000005 $HOME/data/ds000005/sub-01/anat/sub-01_T1w.nii.gz
+
+COPY brain_mri_pipeline.ipynb /home/databot/src/
+
+WORKDIR /home/databot/work
+
+RUN ln -s /home/databot/src/brain_mri_pipeline.ipynb .
+
+EXPOSE 8888
+
+CMD ["jupyter", "notebook", "--ip=0.0.0.0", "--port=8888", "--no-browser"]

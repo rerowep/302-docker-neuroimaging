@@ -1,0 +1,163 @@
+# Native macOS build of the 302 neuroimaging image.
+#
+# ./Dockerfile is deliberately pinned to linux/amd64: it uses AFNI's static
+# `linux_openmp_64` binaries plus back-ported libpng12/libxp6/multiarch-support
+# packages, and its `nipreps/miniconda` base is published for amd64 only. On an
+# Apple Silicon Mac that image can only run under QEMU/Rosetta emulation.
+#
+# This variant builds for the host architecture instead, so `docker build` on an
+# Apple Silicon Mac produces a linux/arm64 image that runs natively. It also
+# still builds on Intel Macs (linux/amd64).
+#
+# What changed to make that possible:
+#   * Base is ubuntu:noble, which is published for both arm64 and amd64.
+#   * AFNI comes from the Ubuntu 24.04 *shared* builds, which NIMH publishes for
+#     both ARM64 and x86_64. Those link against stock noble libraries, so none
+#     of the libpng12 / libxp6 / multiarch-support back-porting is needed.
+#     Because they are shared builds they ship their own libmri.so / libSUMA.so,
+#     so the binaries must NOT be pruned the way the static amd64 build is.
+#   * Python tooling lives in a plain venv rather than conda/micromamba.
+#   * ANTs is omitted: conda-forge publishes it for linux-64 but not
+#     linux-aarch64, and the bundled notebook does not use it.
+
+# Ubuntu 24.04 LTS - Noble. Multi-arch, and the platform AFNI's shared builds target.
+ARG BASE_IMAGE=ubuntu:noble-20250910
+
+# Utilities for downloading packages
+FROM ${BASE_IMAGE} AS downloader
+# Bump the date to current to refresh curl/certificates/etc
+RUN echo "2026.09.14"
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive \
+    apt-get install -y --no-install-recommends \
+                    binutils \
+                    bzip2 \
+                    ca-certificates \
+                    curl \
+                    unzip && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# AFNI
+FROM downloader AS afni
+# Bump the date to current to update AFNI
+RUN echo "2026.09.14"
+# Ask the build container what it is rather than trusting BuildKit's TARGETARCH.
+# TARGETARCH is unusable here: the legacy builder (DOCKER_BUILDKIT=0) never sets
+# it at all, and declaring `ARG TARGETARCH=<default>` to paper over that shadows
+# the value BuildKit would otherwise inject — so a cross-build would silently
+# fetch the wrong package. This stage always runs on the target platform, so
+# dpkg reports the architecture we actually need, under either builder and with
+# or without --platform.
+RUN arch="$(dpkg --print-architecture)" \
+    && case "${arch}" in \
+        arm64) AFNI_BUILD=linux_ubuntu_24_ARM ;; \
+        amd64) AFNI_BUILD=linux_ubuntu_24_64 ;; \
+        *) echo "Unsupported architecture '${arch}': AFNI publishes Ubuntu 24 builds for arm64 and amd64 only." >&2; exit 1 ;; \
+    esac \
+    && echo "Fetching AFNI build ${AFNI_BUILD} for ${arch}" \
+    && mkdir -p /opt/afni-latest \
+    && curl -fsSL --retry 5 "https://afni.nimh.nih.gov/pub/dist/tgz/${AFNI_BUILD}.tgz" \
+    | tar -xz -C /opt/afni-latest --strip-components 1 \
+    --exclude "${AFNI_BUILD}/funstuff" \
+    --exclude "${AFNI_BUILD}/shiny" \
+    --exclude "${AFNI_BUILD}/afnipy" \
+    --exclude "${AFNI_BUILD}/lib/RetroTS" \
+    --exclude "${AFNI_BUILD}/lib_RetroTS" \
+    --exclude "${AFNI_BUILD}/meica.libs"
+
+FROM ${BASE_IMAGE}
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# Runtime dependencies of AFNI's Ubuntu 24.04 shared builds, plus git/git-annex
+# for datalad and the Python interpreter the notebook environment is built on.
+# Note the noble renames: libxt6 -> libxt6t64, libglib2.0-0 -> libglib2.0-0t64,
+# and libglw1-mesa was folded into libglw1-mesa-dev.
+RUN apt-get update -qq \
+    && apt-get install -y -q --no-install-recommends \
+           ca-certificates \
+           curl \
+           ed \
+           git \
+           git-annex \
+           libexpat1 \
+           libgl1 \
+           libglib2.0-0t64 \
+           libglu1-mesa \
+           libglw1-mesa-dev \
+           libgomp1 \
+           libgsl27 \
+           libjpeg62 \
+           libx11-6 \
+           libxext6 \
+           libxm4 \
+           libxpm4 \
+           libxt6t64 \
+           netpbm \
+           python3 \
+           python3-venv \
+           tcsh \
+           xfonts-base \
+           xvfb \
+    && apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* \
+    && ldconfig
+
+# Install AFNI
+ENV AFNI_DIR="/opt/afni"
+COPY --from=afni /opt/afni-latest ${AFNI_DIR}
+ENV PATH="${AFNI_DIR}:$PATH" \
+    LD_LIBRARY_PATH="${AFNI_DIR}" \
+    AFNI_IMSAVE_WARNINGS="NO" \
+    AFNI_MODELPATH="${AFNI_DIR}/models" \
+    AFNI_TTATLAS_DATASET="${AFNI_DIR}/atlases" \
+    AFNI_PLUGINPATH="${AFNI_DIR}/plugins"
+
+# Notebook environment. Every wheel here is pure Python or has arm64 wheels on
+# PyPI, so no conda channel is involved.
+ENV VIRTUAL_ENV="/opt/venv"
+RUN python3 -m venv ${VIRTUAL_ENV}
+ENV PATH="${VIRTUAL_ENV}/bin:$PATH"
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir datalad ipyniivue jupyter
+
+# Create a shared $HOME directory.
+#
+# `databot` is pinned to UID/GID 1000 so this image matches ./Dockerfile, whose
+# base has no user in the 1000+ range. ubuntu:noble ships a stock `ubuntu` user
+# on 1000, so that one has to go first or databot would silently land on 1001
+# and bind-mounted host directories would come back owned by the wrong user.
+#
+# On Linux, override these to line the container user up with your host account:
+#   docker build -f Dockerfile.macos \
+#     --build-arg DATABOT_UID="$(id -u)" --build-arg DATABOT_GID="$(id -g)" ...
+ARG DATABOT_UID=1000
+ARG DATABOT_GID=1000
+RUN if id ubuntu >/dev/null 2>&1; then userdel -r ubuntu >/dev/null 2>&1 || userdel ubuntu; fi \
+    && groupadd -g ${DATABOT_GID} databot \
+    && useradd -m -s /bin/bash -u ${DATABOT_UID} -g ${DATABOT_GID} -G users databot
+
+WORKDIR /home/databot
+ENV HOME="/home/databot"
+
+RUN chmod 755 /home/databot
+
+USER databot
+
+# Pacify datalad
+RUN git config --global user.name "302 data computation" \
+    && git config --global user.email "302@hes-so.ch"
+
+RUN mkdir -p $HOME/data $HOME/outputs $HOME/work $HOME/.local $HOME/src \
+    && chmod 1777 $HOME/data $HOME/outputs $HOME/work $HOME/.local $HOME/src \
+    && datalad clone https://github.com/OpenNeuroDatasets/ds000005 $HOME/data/ds000005 \
+    && datalad get -d $HOME/data/ds000005 $HOME/data/ds000005/sub-01/anat/sub-01_T1w.nii.gz
+
+COPY brain_mri_pipeline.ipynb /home/databot/src/
+
+WORKDIR /home/databot/work
+
+RUN ln -s /home/databot/src/brain_mri_pipeline.ipynb .
+
+EXPOSE 8888
+
+CMD ["jupyter", "notebook", "--ip=0.0.0.0", "--port=8888", "--no-browser"]

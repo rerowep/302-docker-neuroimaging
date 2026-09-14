@@ -1,9 +1,19 @@
 # Ubuntu 22.04 LTS - Jammy
 ARG BASE_IMAGE=ubuntu:jammy-20240125
-
+# This image is intentionally built for linux/amd64: the AFNI binaries and supporting
+# libraries used below (the static linux_openmp_64 build, plus the back-ported libpng12,
+# libxp6 and multiarch-support packages) are Linux/x86_64 only, and the nipreps/miniconda
+# base image is published for amd64 alone.
+#
+# For a build that runs natively on Apple Silicon and other arm64 hosts, use
+# ./Dockerfile.macos instead. It is based on AFNI's Ubuntu 24.04 builds, which NIMH
+# publishes for both ARM64 and x86_64. Note that it does not ship ANTs, which conda-forge
+# does not build for linux-aarch64.
+ARG TARGETPLATFORM=linux/amd64
+ARG TARGETARCH=amd64
 
 # Utilities for downloading packages
-FROM ${BASE_IMAGE} as downloader
+FROM --platform=${TARGETPLATFORM} ${BASE_IMAGE} as downloader
 # Bump the date to current to refresh curl/certificates/etc
 RUN echo "2024.03.18"
 RUN apt-get update && \
@@ -51,7 +61,7 @@ RUN mkdir -p /opt/afni-latest \
        \) -delete
 
        # Use Ubuntu 20.04 LTS
-FROM nipreps/miniconda:py39_2403.0
+FROM --platform=${TARGETPLATFORM} nipreps/miniconda:py39_2403.0
 
 ARG DEBIAN_FRONTEND=noninteractive
 ENV LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:${CONDA_PATH}/lib"
